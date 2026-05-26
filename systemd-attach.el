@@ -1212,50 +1212,61 @@ all local metadata in the current dashboard scope after confirmation."
   "Return Evil prefixed key using PREFIX and KEY."
   (kbd (string-join (list prefix key) " ")))
 
+(defun systemd-attach--evil-define-key (state keymap &rest bindings)
+  "Define Evil BINDINGS for STATE in KEYMAP without compile-time Evil macros."
+  (when (fboundp 'evil-define-key)
+    (eval
+     (append (list 'evil-define-key
+                   (list 'quote state)
+                   (list 'quote keymap))
+             (mapcar (lambda (binding) (list 'quote binding))
+                     bindings)))))
+
 (defun systemd-attach--dashboard-evil-define-keys ()
   "Define optional Evil normal-state dashboard keys."
   (when (fboundp 'evil-set-initial-state)
     (evil-set-initial-state 'systemd-attach-dashboard-mode 'normal))
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal systemd-attach-dashboard-mode-map
-      (kbd "RET") #'systemd-attach-dashboard-view)
-    (when systemd-attach-dashboard-evil-prefix
-      (evil-define-key 'normal systemd-attach-dashboard-mode-map
-        (systemd-attach--dashboard-prefix-key "RET")
-        #'systemd-attach-dashboard-view
-        (systemd-attach--dashboard-prefix-key "v")
-        #'systemd-attach-dashboard-view
-        (systemd-attach--dashboard-prefix-key "f")
-        #'systemd-attach-dashboard-follow
-        (systemd-attach--dashboard-prefix-key "g")
-        #'systemd-attach-dashboard-refresh
-        (systemd-attach--dashboard-prefix-key "r")
-        #'systemd-attach-dashboard-refresh
-        (systemd-attach--dashboard-prefix-key "R")
-        (lambda ()
-          (interactive)
-          (systemd-attach-dashboard-refresh t))
-        (systemd-attach--dashboard-prefix-key "k")
-        #'systemd-attach-dashboard-kill
-        (systemd-attach--dashboard-prefix-key "!")
-        #'systemd-attach-dashboard-rerun
-        (systemd-attach--dashboard-prefix-key "d")
-        #'systemd-attach-dashboard-delete
-        (systemd-attach--dashboard-prefix-key "x")
-        #'systemd-attach-dashboard-cleanup))))
+  (systemd-attach--evil-define-key
+   'normal systemd-attach-dashboard-mode-map
+   (kbd "RET") #'systemd-attach-dashboard-view)
+  (when systemd-attach-dashboard-evil-prefix
+    (systemd-attach--evil-define-key
+     'normal systemd-attach-dashboard-mode-map
+     (systemd-attach--dashboard-prefix-key "RET")
+     #'systemd-attach-dashboard-view
+     (systemd-attach--dashboard-prefix-key "v")
+     #'systemd-attach-dashboard-view
+     (systemd-attach--dashboard-prefix-key "f")
+     #'systemd-attach-dashboard-follow
+     (systemd-attach--dashboard-prefix-key "g")
+     #'systemd-attach-dashboard-refresh
+     (systemd-attach--dashboard-prefix-key "r")
+     #'systemd-attach-dashboard-refresh
+     (systemd-attach--dashboard-prefix-key "R")
+     (lambda ()
+       (interactive)
+       (systemd-attach-dashboard-refresh t))
+     (systemd-attach--dashboard-prefix-key "k")
+     #'systemd-attach-dashboard-kill
+     (systemd-attach--dashboard-prefix-key "!")
+     #'systemd-attach-dashboard-rerun
+     (systemd-attach--dashboard-prefix-key "d")
+     #'systemd-attach-dashboard-delete
+     (systemd-attach--dashboard-prefix-key "x")
+     #'systemd-attach-dashboard-cleanup)))
 
 (defun systemd-attach--dired-evil-define-keys ()
   "Define optional Evil normal-state Dired keys."
   (when (and systemd-attach-dired-evil-prefix
-             (boundp 'dired-mode-map)
-             (fboundp 'evil-define-key))
-    (evil-define-key 'normal dired-mode-map
-      (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "&")
-      #'systemd-attach-dired-do-shell-command
-      (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "c")
-      #'systemd-attach-dired-command
-      (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "m")
-      #'systemd-attach-dired-command-with-marked-files)))
+             (boundp 'dired-mode-map))
+    (systemd-attach--evil-define-key
+     'normal dired-mode-map
+     (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "&")
+     #'systemd-attach-dired-do-shell-command
+     (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "c")
+     #'systemd-attach-dired-command
+     (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "m")
+     #'systemd-attach-dired-command-with-marked-files)))
 
 (with-eval-after-load 'evil
   (systemd-attach--dashboard-evil-define-keys)
