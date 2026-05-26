@@ -1212,13 +1212,16 @@ all local metadata in the current dashboard scope after confirmation."
   "Return Evil prefixed key using PREFIX and KEY."
   (kbd (string-join (list prefix key) " ")))
 
-(defun systemd-attach--evil-define-key (state keymap &rest bindings)
-  "Define Evil BINDINGS for STATE in KEYMAP without compile-time Evil macros."
-  (when (fboundp 'evil-define-key)
+(defun systemd-attach--evil-define-key (state keymap-symbol &rest bindings)
+  "Define Evil BINDINGS for STATE in KEYMAP-SYMBOL.
+This avoids compile-time Evil macro expansion while still passing a keymap
+symbol, not an evaluated keymap object, to `evil-define-key'."
+  (when (and (symbolp keymap-symbol)
+             (fboundp 'evil-define-key))
     (eval
      (append (list 'evil-define-key
                    (list 'quote state)
-                   (list 'quote keymap))
+                   keymap-symbol)
              (mapcar (lambda (binding) (list 'quote binding))
                      bindings)))))
 
@@ -1227,11 +1230,11 @@ all local metadata in the current dashboard scope after confirmation."
   (when (fboundp 'evil-set-initial-state)
     (evil-set-initial-state 'systemd-attach-dashboard-mode 'normal))
   (systemd-attach--evil-define-key
-   'normal systemd-attach-dashboard-mode-map
+   'normal 'systemd-attach-dashboard-mode-map
    (kbd "RET") #'systemd-attach-dashboard-view)
   (when systemd-attach-dashboard-evil-prefix
     (systemd-attach--evil-define-key
-     'normal systemd-attach-dashboard-mode-map
+     'normal 'systemd-attach-dashboard-mode-map
      (systemd-attach--dashboard-prefix-key "RET")
      #'systemd-attach-dashboard-view
      (systemd-attach--dashboard-prefix-key "v")
@@ -1260,7 +1263,7 @@ all local metadata in the current dashboard scope after confirmation."
   (when (and systemd-attach-dired-evil-prefix
              (boundp 'dired-mode-map))
     (systemd-attach--evil-define-key
-     'normal dired-mode-map
+     'normal 'dired-mode-map
      (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "&")
      #'systemd-attach-dired-do-shell-command
      (systemd-attach--evil-prefix-key systemd-attach-dired-evil-prefix "c")

@@ -506,6 +506,19 @@
   (should (equal (systemd-attach--evil-prefix-key "SPC m" "m")
                  (kbd "SPC m m"))))
 
+(ert-deftest systemd-attach-evil-define-key-uses-keymap-symbol ()
+  (let (captured)
+    (cl-letf (((symbol-function 'evil-define-key)
+               (lambda (&rest _) nil))
+              ((symbol-function 'eval)
+               (lambda (form &optional _lexical)
+                 (setq captured form))))
+      (systemd-attach--evil-define-key
+       'normal 'dired-mode-map
+       (kbd "SPC m &") #'systemd-attach-dired-do-shell-command)
+      (should (equal (nth 2 captured) 'dired-mode-map))
+      (should-not (keymapp (nth 2 captured))))))
+
 (ert-deftest systemd-attach-integration-starts-echo ()
   (unless (getenv "SYSTEMD_ATTACH_INTEGRATION")
     (ert-skip "Set SYSTEMD_ATTACH_INTEGRATION=1 to run systemd integration tests"))
