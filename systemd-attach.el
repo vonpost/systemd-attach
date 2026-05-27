@@ -47,6 +47,23 @@
   "Program used to read transient service output."
   :type 'string)
 
+(defcustom systemd-attach-tail-program "tail"
+  "Program used to read and follow file-backed session output."
+  :type 'string)
+
+(defcustom systemd-attach-output-backend 'journal
+  "Output backend used for new systemd-attach sessions.
+The `journal' backend writes output to journald and reads it with journalctl.
+The `file' backend redirects stdout and stderr inside the wrapper to a log file
+on the target host, useful for systems where journald is unavailable or stale."
+  :type '(choice (const :tag "journalctl" journal)
+                 (const :tag "file" file)))
+
+(defcustom systemd-attach-file-log-directory "~/.cache/systemd-attach"
+  "Directory on the target host used for file-backed session logs.
+For TRAMP sessions this is interpreted on the remote target."
+  :type 'string)
+
 (defcustom systemd-attach-shell-program "/bin/sh"
   "Shell used to execute commands."
   :type 'string)
@@ -120,6 +137,13 @@ refresh fails, for example because a TRAMP connection is no longer available."
   "Session states considered safe to remove during metadata cleanup."
   :type '(repeat string))
 
+(defcustom systemd-attach-delete-file-logs-on-cleanup t
+  "Whether cleanup also deletes exact file-backed session logs.
+Only sessions using the `file' output backend are affected.  Missing files are
+ignored.  TRAMP or filesystem errors are reported but do not abort metadata
+cleanup."
+  :type 'boolean)
+
 (defcustom systemd-attach-dired-prefix-key (kbd "C-c C-s")
   "Prefix key for systemd-attach commands in Dired buffers.
 Set to nil to avoid installing Dired keybindings."
@@ -177,7 +201,9 @@ Set to nil to avoid installing Dired keybindings."
   sub-state
   result
   exit-code
-  refresh-error)
+  refresh-error
+  output-backend
+  log-file)
 
 (defun systemd-attach--now-string ()
   "Return the current time as an ISO-like UTC string."
@@ -221,6 +247,27 @@ Set to nil to avoid installing Dired keybindings."
   (or (systemd-attach-session-default-directory session)
       default-directory))
 
+(defun systemd-attach--target-local-file-name (file)
+  "Return FILE as a target-local path if FILE is remote."
+  (or (and (file-remote-p file)
+           (file-remote-p file 'localname))
+      (expand-file-name file)))
+
+(defun systemd-attach--file-log-directory (directory)
+  "Return the Emacs file name for file-backed logs under DIRECTORY's target."
+  (file-name-as-directory
+   (expand-file-name systemd-attach-file-log-directory directory)))
+
+(defun systemd-attach--file-log-file (id directory)
+  "Return the target-local log file path for ID under DIRECTORY's target."
+  (systemd-attach--target-local-file-name
+   (expand-file-name (concat id ".log")
+                     (systemd-attach--file-log-directory directory))))
+
+(defun systemd-attach--ensure-file-log-directory (directory)
+  "Create the file-backed log directory under DIRECTORY's target."
+  (make-directory (systemd-attach--file-log-directory directory) t))
+
 (defun systemd-attach--json-encode (object)
   "Encode OBJECT as compact JSON."
   (if (fboundp 'json-serialize)
@@ -230,7 +277,8 @@ Set to nil to avoid installing Dired keybindings."
           (json-false nil))
       (json-encode object))))
 
-(defun systemd-attach--metadata-json (id unit working-directory command origin)
+(defun systemd-attach--metadata-json (id unit working-directory command origin
+                                               &optional output-backend log-file)
   "Return JSON metadata for a systemd-attach run."
   (systemd-attach--json-encode
    `((version . 1)
@@ -239,24 +287,45 @@ Set to nil to avoid installing Dired keybindings."
      (command . ,command)
      (working_directory . ,working-directory)
      (origin . ,(if origin (format "%s" origin) "manual"))
-     (created_at . ,(systemd-attach--now-string)))))
+     (created_at . ,(systemd-attach--now-string))
+     (output_backend . ,(and output-backend
+                             (format "%s" output-backend)))
+     (log_file . ,log-file))))
 
 (defun systemd-attach--shell-single-quote (string)
   "Return STRING safely quoted for POSIX shell single-quote context."
   (concat "'" (replace-regexp-in-string "'" "'\\\\''" string t t) "'"))
 
-(defun systemd-attach--wrapped-command (command metadata-json)
+(defun systemd-attach--wrapped-command (command metadata-json &optional log-file)
   "Return shell text that runs COMMAND and logs its exit status.
 The user command is evaluated in a subshell so a plain `exit' in COMMAND does
-not prevent the status marker from being emitted by the wrapper."
-  (format "printf '%%s\\n' %s\n( %s\n)\nsystemd_attach_status=$?\nprintf '\\n%s%%s]\\n' \"$systemd_attach_status\"\nexit \"$systemd_attach_status\""
+not prevent the status marker from being emitted by the wrapper.  If LOG-FILE is
+non-nil, stdout and stderr are redirected there before any output is emitted."
+  (format "%sprintf '%%s\\n' %s\n( %s\n)\nsystemd_attach_status=$?\nprintf '\\n%s%%s]\\n' \"$systemd_attach_status\"\nexit \"$systemd_attach_status\""
+          (if log-file
+              (format "systemd_attach_log=%s\nexec >> \"$systemd_attach_log\" 2>&1\n"
+                      (systemd-attach--shell-single-quote log-file))
+            "")
           (systemd-attach--shell-single-quote
            (concat systemd-attach--metadata-marker-prefix metadata-json "]"))
           command
           systemd-attach--exit-marker-prefix))
 
+(defun systemd-attach--service-properties (output-backend)
+  "Return systemd-run service properties for OUTPUT-BACKEND."
+  (let ((properties systemd-attach-default-properties))
+    (if (eq output-backend 'file)
+        (append
+         (cl-remove-if
+          (lambda (property)
+            (string-match-p "\\`Standard\\(?:Output\\|Error\\)=" property))
+          properties)
+         '("StandardOutput=null" "StandardError=null"))
+      properties)))
+
 (defun systemd-attach--systemd-run-args (id unit working-directory command
-                                           &optional json-output origin)
+                                           &optional json-output origin
+                                           output-backend log-file)
   "Build systemd-run arguments for ID, UNIT, WORKING-DIRECTORY, and COMMAND."
   (append
    (list "--user"
@@ -270,12 +339,13 @@ not prevent the status marker from being emitted by the wrapper."
    (when json-output
      (list "--json=short"))
    (cl-mapcan (lambda (property) (list "--property" property))
-              systemd-attach-default-properties)
+              (systemd-attach--service-properties output-backend))
    (list systemd-attach-shell-program "-lc"
          (systemd-attach--wrapped-command
           command
           (systemd-attach--metadata-json
-           id unit working-directory command origin)))))
+           id unit working-directory command origin output-backend log-file)
+          log-file))))
 
 (defun systemd-attach--journal-args (session &optional follow lines)
   "Build journalctl arguments for SESSION.
@@ -467,7 +537,11 @@ the struct grows new slots."
      :exit-code (systemd-attach--safe-session-slot
                  session #'systemd-attach-session-exit-code)
      :refresh-error (systemd-attach--safe-session-slot
-                     session #'systemd-attach-session-refresh-error))))
+                     session #'systemd-attach-session-refresh-error)
+     :output-backend (systemd-attach--safe-session-slot
+                      session #'systemd-attach-session-output-backend)
+     :log-file (systemd-attach--safe-session-slot
+                session #'systemd-attach-session-log-file))))
 
 (defun systemd-attach--load-sessions ()
   "Load session metadata if needed."
@@ -558,6 +632,38 @@ the struct grows new slots."
   (if (numberp (systemd-attach-session-exit-code session))
       (number-to-string (systemd-attach-session-exit-code session))
     ""))
+
+(defun systemd-attach--session-output-backend (session)
+  "Return SESSION's output backend."
+  (or (systemd-attach-session-output-backend session) 'journal))
+
+(defun systemd-attach--session-log-file (session)
+  "Return SESSION's target-local log file, deriving it when possible."
+  (or (systemd-attach-session-log-file session)
+      (and (eq (systemd-attach--session-output-backend session) 'file)
+           (systemd-attach--file-log-file
+            (systemd-attach-session-id session)
+            (systemd-attach--session-directory session)))))
+
+(defun systemd-attach--read-file-output (session &optional lines)
+  "Read file-backed output for SESSION, optionally limited to LINES."
+  (let ((log-file (or (systemd-attach--session-log-file session)
+                      (error "Session has no file-backed log path"))))
+    (systemd-attach--call-or-error
+     systemd-attach-tail-program
+     (if lines
+         (list "-n" (number-to-string lines) log-file)
+       (list "-n" "+1" log-file))
+     (systemd-attach--session-directory session))))
+
+(defun systemd-attach--read-output (session &optional lines)
+  "Read SESSION output from its configured backend."
+  (pcase (systemd-attach--session-output-backend session)
+    ('file (systemd-attach--read-file-output session lines))
+    (_ (systemd-attach--call-or-error
+        systemd-attach-journalctl-program
+        (systemd-attach--journal-args session nil lines)
+        (systemd-attach--session-directory session)))))
 
 (defun systemd-attach--session-needs-refresh-p (session)
   "Return non-nil if SESSION has a nonterminal cached state."
@@ -652,7 +758,10 @@ the struct grows new slots."
           (working-directory
            (systemd-attach--metadata-get metadata 'working_directory))
           (origin (systemd-attach--metadata-get metadata 'origin))
-          (created-at (systemd-attach--metadata-get metadata 'created_at)))
+          (created-at (systemd-attach--metadata-get metadata 'created_at))
+          (output-backend
+           (systemd-attach--metadata-get metadata 'output_backend))
+          (log-file (systemd-attach--metadata-get metadata 'log_file)))
       (when (and id (stringp id))
         (setf (systemd-attach-session-id session) id))
       (when (and unit (stringp unit))
@@ -666,6 +775,11 @@ the struct grows new slots."
         (setf (systemd-attach-session-origin session) origin))
       (when (and created-at (stringp created-at))
         (setf (systemd-attach-session-created-at session) created-at))
+      (when (and output-backend (stringp output-backend))
+        (setf (systemd-attach-session-output-backend session)
+              (intern output-backend)))
+      (when (and log-file (stringp log-file))
+        (setf (systemd-attach-session-log-file session) log-file))
       (setf (systemd-attach-session-default-directory session)
             (or (systemd-attach-session-default-directory session)
                 directory)
@@ -750,6 +864,10 @@ same target so completed collected jobs remain visible."
                                           (number-to-string
                                            (systemd-attach-session-exit-code session))
                                         "unknown")))
+                 ("Backend" . ,(format "%s"
+                                         (systemd-attach--session-output-backend
+                                          session)))
+                 ("Log" . ,(systemd-attach--session-log-file session))
                  ("Refresh" . ,(or (systemd-attach-session-refresh-error session)
                                     "ok"))
                  ("Command" . ,(systemd-attach-session-command session))))
@@ -828,9 +946,19 @@ ORIGIN is a short symbol or string describing the caller."
          (id (systemd-attach--generate-id))
          (unit (systemd-attach--unit-name id))
          (working-directory (systemd-attach--working-directory directory))
-         (args (systemd-attach--systemd-run-args
-                id unit working-directory command
-                systemd-attach-use-json-output origin))
+         (output-backend systemd-attach-output-backend)
+         (log-file (and (eq output-backend 'file)
+                        (systemd-attach--file-log-file id directory)))
+         (args (progn
+                 (unless (memq output-backend '(journal file))
+                   (error "Unknown systemd-attach output backend: %S"
+                          output-backend))
+                 (when log-file
+                   (systemd-attach--ensure-file-log-directory directory))
+                 (systemd-attach--systemd-run-args
+                  id unit working-directory command
+                  systemd-attach-use-json-output origin
+                  output-backend log-file)))
          (output (systemd-attach--start-call args directory))
          (parsed (systemd-attach--parse-run-output output))
          (actual-unit (or (car parsed) unit))
@@ -844,7 +972,9 @@ ORIGIN is a short symbol or string describing the caller."
                    :remote (systemd-attach--remote-name directory)
                    :origin (if origin (format "%s" origin) "manual")
                    :created-at (systemd-attach--now-string)
-                   :state "starting")))
+                   :state "starting"
+                   :output-backend output-backend
+                   :log-file log-file)))
     (systemd-attach--put-session session)
     (message "Started %s as %s" id actual-unit)
     (pcase systemd-attach-open-after-start
@@ -935,11 +1065,10 @@ and otherwise Dired appends file names using its normal shell quoting rules."
                         systemd-attach-systemctl-program
                         (systemd-attach--systemctl-show-args session)
                         directory))
-         (journal-output (cdr (systemd-attach--call
-                               systemd-attach-journalctl-program
-                               (systemd-attach--journal-args session nil 80)
-                               directory))))
-    (when-let ((metadata (systemd-attach--extract-metadata journal-output)))
+         (session-output (condition-case nil
+                             (systemd-attach--read-output session 80)
+                           (error ""))))
+    (when-let ((metadata (systemd-attach--extract-metadata session-output)))
       (systemd-attach--apply-metadata session metadata directory))
     (if (zerop (car state-output))
         (let* ((props (systemd-attach--parse-properties (cdr state-output)))
@@ -958,7 +1087,7 @@ and otherwise Dired appends file names using its normal shell quoting rules."
             (systemd-attach-session-sub-state session) "unloaded"
             (systemd-attach-session-refresh-error session)
             (string-trim (cdr state-output))))
-    (when-let ((exit-code (systemd-attach--extract-exit-code journal-output)))
+    (when-let ((exit-code (systemd-attach--extract-exit-code session-output)))
       (setf (systemd-attach-session-exit-code session) exit-code)
       (when (member (systemd-attach-session-state session) '("unknown" nil))
         (setf (systemd-attach-session-state session)
@@ -1094,25 +1223,64 @@ With REFRESH-STATE, force state refresh for every row."
   (systemd-attach-delete-session (systemd-attach--dashboard-session-at-point))
   (systemd-attach-dashboard-refresh))
 
+(defvar systemd-attach--last-log-cleanup-errors nil)
+
+(defun systemd-attach--session-log-file-name (session)
+  "Return SESSION's log file as an Emacs file name for its target."
+  (when-let ((log-file (systemd-attach--session-log-file session)))
+    (let ((directory (systemd-attach--session-directory session)))
+      (cond
+       ((file-remote-p log-file) log-file)
+       ((file-name-absolute-p log-file)
+        (concat (or (file-remote-p directory) "") log-file))
+       (t (expand-file-name log-file directory))))))
+
+(defun systemd-attach--delete-session-log-file (session)
+  "Delete SESSION's exact file-backed log file if configured.
+Return nil on success or a human-readable error string on failure."
+  (when (and systemd-attach-delete-file-logs-on-cleanup
+             (eq (systemd-attach--session-output-backend session) 'file))
+    (condition-case err
+        (when-let ((log-file (systemd-attach--session-log-file-name session)))
+          (when (file-exists-p log-file)
+            (delete-file log-file)))
+      (error
+       (format "%s: %s"
+               (systemd-attach-session-id session)
+               (error-message-string err))))))
+
 (defun systemd-attach--cleanup-sessions (predicate)
   "Delete local metadata for sessions matching PREDICATE.
-Return the number of deleted sessions."
+Return the number of deleted sessions.  If file-log deletion fails, details are
+stored in `systemd-attach--last-log-cleanup-errors'."
   (systemd-attach--load-sessions)
-  (let ((before (length systemd-attach--sessions)))
-    (setq systemd-attach--sessions
-          (cl-remove-if predicate systemd-attach--sessions))
+  (let* ((removed (cl-remove-if-not predicate systemd-attach--sessions))
+         (kept (cl-remove-if predicate systemd-attach--sessions)))
+    (setq systemd-attach--last-log-cleanup-errors
+          (delq nil (mapcar #'systemd-attach--delete-session-log-file removed)))
+    (setq systemd-attach--sessions kept)
     (systemd-attach--save-sessions)
-    (- before (length systemd-attach--sessions))))
+    (length removed)))
 
 (defun systemd-attach--cleanup-message (count scope all)
   "Report that COUNT sessions were cleaned up from SCOPE.
 ALL non-nil means the cleanup removed all metadata in scope, not just terminal
 sessions."
-  (message "Deleted %s %s session metadata entr%s from %s"
-           count
-           (if all "total" "terminal")
-           (if (= count 1) "y" "ies")
-           scope))
+  (let ((message-text
+         (format "Deleted %s %s session metadata entr%s from %s"
+                 count
+                 (if all "total" "terminal")
+                 (if (= count 1) "y" "ies")
+                 scope)))
+    (if systemd-attach--last-log-cleanup-errors
+        (message "%s; %s log deletion error%s: %s"
+                 message-text
+                 (length systemd-attach--last-log-cleanup-errors)
+                 (if (= (length systemd-attach--last-log-cleanup-errors) 1)
+                     ""
+                   "s")
+                 (string-join systemd-attach--last-log-cleanup-errors "; "))
+      (message "%s" message-text))))
 
 ;;;###autoload
 (defun systemd-attach-cleanup-sessions (&optional all)
@@ -1120,7 +1288,9 @@ sessions."
 By default this removes only terminal sessions, as defined by
 `systemd-attach-cleanup-terminal-states' or sessions with a recorded exit code.
 With prefix argument ALL, delete all local metadata for the current target.
-This never stops systemd units and never removes journal history."
+This never stops systemd units and never removes journal history.  When
+`systemd-attach-delete-file-logs-on-cleanup' is non-nil, exact file-backed logs
+for removed sessions are deleted too."
   (interactive "P")
   (let ((directory default-directory))
     (when (or (not all)
@@ -1142,7 +1312,9 @@ This never stops systemd units and never removes journal history."
   "Delete old local metadata across all known targets.
 By default this removes only terminal sessions.  With prefix argument ALL,
 delete every locally known metadata entry after confirmation.  This never stops
-systemd units and never removes journal history."
+systemd units and never removes journal history.  When
+`systemd-attach-delete-file-logs-on-cleanup' is non-nil, exact file-backed logs
+for removed sessions are deleted too."
   (interactive "P")
   (when (or (not all)
             (yes-or-no-p "Delete all locally known systemd-attach metadata? "))
@@ -1315,7 +1487,7 @@ With prefix argument REFRESH-STATE, force-refresh every displayed row."
 
 ;;;###autoload
 (defun systemd-attach-view-session (&optional session lines compilation)
-  "View SESSION journal output.
+  "View SESSION output.
 Optional LINES limits output to the last LINES entries.  With interactive prefix
 argument, use `compilation-mode'."
   (interactive
@@ -1326,11 +1498,7 @@ argument, use `compilation-mode'."
          (lines (or lines systemd-attach-default-tail-lines))
          (buffer (get-buffer-create (systemd-attach--buffer-name session)))
          (inhibit-read-only t)
-         (directory (systemd-attach--session-directory session))
-         (output (systemd-attach--call-or-error
-                  systemd-attach-journalctl-program
-                  (systemd-attach--journal-args session nil lines)
-                  directory)))
+         (output (systemd-attach--read-output session lines)))
     (condition-case nil
         (systemd-attach-refresh-session session)
       (error nil))
@@ -1376,12 +1544,21 @@ argument, use `compilation-mode'."
 
 ;;;###autoload
 (defun systemd-attach-follow-session (&optional session lines)
-  "Follow SESSION journal output."
+  "Follow SESSION output."
   (interactive (list (systemd-attach--read-session)
                      systemd-attach-default-tail-lines))
   (let* ((session (or session (systemd-attach--read-session)))
          (buffer (get-buffer-create (systemd-attach--buffer-name session "follow")))
-         (args (systemd-attach--journal-args session t lines))
+         (output-backend (systemd-attach--session-output-backend session))
+         (program (if (eq output-backend 'file)
+                      systemd-attach-tail-program
+                    systemd-attach-journalctl-program))
+         (args (if (eq output-backend 'file)
+                   (list "-n" (number-to-string
+                                (or lines systemd-attach-default-tail-lines))
+                         "-f" (or (systemd-attach--session-log-file session)
+                                    (error "Session has no file-backed log path")))
+                 (systemd-attach--journal-args session t lines)))
          (default-directory (systemd-attach--session-directory session)))
     (when-let ((old-process (get-buffer-process buffer)))
       (when (process-live-p old-process)
@@ -1398,7 +1575,7 @@ argument, use `compilation-mode'."
                           (format "systemd-attach-follow-%s"
                                   (systemd-attach-session-id session))
                           buffer
-                          systemd-attach-journalctl-program
+                          program
                           args)))
       (set-process-filter process #'systemd-attach--follow-filter)
       (set-process-sentinel
@@ -1469,13 +1646,10 @@ With interactive prefix argument, prompt for LINES."
   (interactive
    (list (systemd-attach--read-session)
          (if current-prefix-arg
-             (read-number "Journal lines: " systemd-attach-default-tail-lines)
+             (read-number "Output lines: " systemd-attach-default-tail-lines)
            systemd-attach-default-tail-lines)))
   (let* ((session (or session (systemd-attach--read-session)))
-         (output (systemd-attach--call-or-error
-                  systemd-attach-journalctl-program
-                  (systemd-attach--journal-args session nil lines)
-                  (systemd-attach--session-directory session))))
+         (output (systemd-attach--read-output session lines)))
     (kill-new (systemd-attach--display-output output))
     (message "Copied output for %s" (systemd-attach-session-id session))))
 

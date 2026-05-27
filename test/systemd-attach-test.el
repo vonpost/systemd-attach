@@ -60,6 +60,63 @@
     (should (string-match-p "\\[systemd-attach exit status: %s\\]"
                             (car (last args))))))
 
+(ert-deftest systemd-attach-file-backend-overrides-journal-properties ()
+  (let ((systemd-attach-default-properties
+         '("StandardInput=null" "StandardOutput=journal"
+           "StandardError=journal" "KillMode=control-group")))
+    (should (equal (systemd-attach--service-properties 'file)
+                   '("StandardInput=null" "KillMode=control-group"
+                     "StandardOutput=null" "StandardError=null")))
+    (should (member "StandardOutput=journal"
+                    (systemd-attach--service-properties 'journal)))))
+
+(ert-deftest systemd-attach-file-backend-wraps-output-redirection ()
+  (let ((wrapped (systemd-attach--wrapped-command
+                  "echo hello"
+                  "{}"
+                  "/tmp/systemd attach.log")))
+    (should (string-match-p "systemd_attach_log='/tmp/systemd attach.log'"
+                            wrapped))
+    (should (string-match-p "exec >> \\\"\\$systemd_attach_log\\\" 2>&1"
+                            wrapped))
+    (should (string-match-p "echo hello" wrapped))))
+
+(ert-deftest systemd-attach-file-backend-run-args ()
+  (let* ((systemd-attach-default-properties
+          '("StandardInput=null" "StandardOutput=journal"
+            "StandardError=journal"))
+         (args (systemd-attach--systemd-run-args
+                "id" "id.service" "/tmp" "echo hi" nil 'test
+                'file "/tmp/id.log"))
+         (script (car (last args))))
+    (should (member "StandardOutput=null" args))
+    (should (member "StandardError=null" args))
+    (should-not (member "StandardOutput=journal" args))
+    (should (string-match-p "exec >>" script))
+    (should (string-match-p "\\\"output_backend\\\":\\\"file\\\"" script))
+    (should (string-match-p "\\\"log_file\\\":\\\"/tmp/id.log\\\"" script))))
+
+(ert-deftest systemd-attach-file-backend-read-output-uses-tail ()
+  (let ((session (systemd-attach--make-session
+                  :id "id"
+                  :unit "id.service"
+                  :default-directory "/tmp/"
+                  :output-backend 'file
+                  :log-file "/tmp/id.log"))
+        captured-program
+        captured-args
+        captured-directory)
+    (cl-letf (((symbol-function 'systemd-attach--call-or-error)
+               (lambda (program args directory)
+                 (setq captured-program program
+                       captured-args args
+                       captured-directory directory)
+                 "output")))
+      (should (equal (systemd-attach--read-output session 20) "output"))
+      (should (equal captured-program systemd-attach-tail-program))
+      (should (equal captured-args '("-n" "20" "/tmp/id.log")))
+      (should (equal captured-directory "/tmp/")))))
+
 (ert-deftest systemd-attach-journal-args-do-not-filter-invocation ()
   (let ((session (systemd-attach--make-session
                   :id "id"
@@ -264,6 +321,69 @@
           (should (systemd-attach--session-by-id "local-active"))
           (should (systemd-attach--session-by-id "remote-finished")))
       (delete-file temp-file))))
+
+(ert-deftest systemd-attach-cleanup-deletes-file-backed-log ()
+  (let* ((temp-file (make-temp-file "systemd-attach-sessions"))
+         (log-file (make-temp-file "systemd-attach-log"))
+         (systemd-attach-session-file temp-file)
+         (systemd-attach-delete-file-logs-on-cleanup t)
+         (session (systemd-attach--make-session
+                   :id "file"
+                   :unit "file.service"
+                   :default-directory "/tmp/"
+                   :working-directory "/tmp"
+                   :state "finished"
+                   :output-backend 'file
+                   :log-file log-file))
+         (systemd-attach--sessions (list session))
+         (systemd-attach--sessions-loaded t))
+    (unwind-protect
+        (progn
+          (should (file-exists-p log-file))
+          (should (= (systemd-attach--cleanup-sessions
+                      #'systemd-attach--session-terminal-p)
+                     1))
+          (should-not (file-exists-p log-file))
+          (should-not systemd-attach--last-log-cleanup-errors))
+      (when (file-exists-p temp-file)
+        (delete-file temp-file))
+      (when (file-exists-p log-file)
+        (delete-file log-file)))))
+
+(ert-deftest systemd-attach-cleanup-keeps-file-log-when-disabled ()
+  (let* ((temp-file (make-temp-file "systemd-attach-sessions"))
+         (log-file (make-temp-file "systemd-attach-log"))
+         (systemd-attach-session-file temp-file)
+         (systemd-attach-delete-file-logs-on-cleanup nil)
+         (session (systemd-attach--make-session
+                   :id "file"
+                   :unit "file.service"
+                   :default-directory "/tmp/"
+                   :working-directory "/tmp"
+                   :state "finished"
+                   :output-backend 'file
+                   :log-file log-file))
+         (systemd-attach--sessions (list session))
+         (systemd-attach--sessions-loaded t))
+    (unwind-protect
+        (progn
+          (should (= (systemd-attach--cleanup-sessions
+                      #'systemd-attach--session-terminal-p)
+                     1))
+          (should (file-exists-p log-file)))
+      (when (file-exists-p temp-file)
+        (delete-file temp-file))
+      (when (file-exists-p log-file)
+        (delete-file log-file)))))
+
+(ert-deftest systemd-attach-session-log-file-name-builds-tramp-path ()
+  (let ((session (systemd-attach--make-session
+                  :id "remote"
+                  :default-directory "/ssh:host:/tmp/project/"
+                  :output-backend 'file
+                  :log-file "/home/me/.cache/systemd-attach/remote.log")))
+    (should (equal (systemd-attach--session-log-file-name session)
+                   "/ssh:host:/home/me/.cache/systemd-attach/remote.log"))))
 
 (ert-deftest systemd-attach-dashboard-builds-entries ()
   (let* ((sessions

@@ -6,7 +6,7 @@ jobs with `systemd-run --user`.
 It is intended to feel like a remote-safe `async-shell-command`: launch a long
 job locally or through TRAMP, disconnect Emacs or your laptop, then later view,
 follow, stop, delete, or rerun the job from Emacs. Output is read from
-`journalctl`.
+`journalctl` by default, or from target-local log files with the file backend.
 
 This is not a `screen`, `tmux`, or `dtach` replacement. Version 0.1 treats stdin
 as unsupported after launch. Commands that prompt, run curses interfaces, open
@@ -23,12 +23,36 @@ test against your own Emacs/TRAMP/systemd setup before relying on it.
 - Emacs 28.1 or newer
 - `systemd-run`
 - `systemctl`
-- `journalctl`
+- `journalctl` for the default journal backend
+- `tail` for the file output backend
 - `/bin/sh`
 - A working user systemd manager on the target host
 
 For TRAMP usage, those programs must exist on the remote host and the remote
 user must be able to run user units.
+
+## Output Backends
+
+The default backend uses journald:
+
+```elisp
+(setq systemd-attach-output-backend 'journal)
+```
+
+If a host can run `systemd-run --user` but journald is unavailable, stale, or
+not ingesting current logs, use the file backend:
+
+```elisp
+(setq systemd-attach-output-backend 'file)
+```
+
+The file backend redirects stdout and stderr inside the shell wrapper to a
+target-local log file under `systemd-attach-file-log-directory`, which defaults
+to `~/.cache/systemd-attach` on the target host. Viewing, following, refreshing,
+and copying output then use `tail` instead of `journalctl`.
+
+This backend is intentionally explicit rather than auto-detected, because
+probing journald over TRAMP can be slow or misleading on unusual systems.
 
 ## Installation
 
@@ -192,11 +216,19 @@ style prefix, `SPC m`:
 
 Single-key Evil movement and operators are left alone.
 
-Cleanup only edits the local session metadata file. It does not stop systemd
-units and does not delete journal history. By default, cleanup removes sessions
-whose cached state is `finished`, `failed`, or `inactive`, plus sessions with a
-recorded exit code. Use a prefix argument with the cleanup commands to wipe all
-metadata in the selected scope after confirmation.
+Cleanup removes local session metadata and never stops systemd units or
+deletes journal history. By default, cleanup removes sessions whose cached state
+is `finished`, `failed`, or `inactive`, plus sessions with a recorded exit code.
+Use a prefix argument with the cleanup commands to wipe all metadata in the
+selected scope after confirmation.
+
+For file-backed sessions, cleanup also deletes the exact recorded log file when
+`systemd-attach-delete-file-logs-on-cleanup` is non-nil, which is the default.
+For TRAMP sessions this uses the session's saved target, so a log like
+`/home/me/.cache/systemd-attach/id.log` is deleted through the corresponding
+TRAMP path, for example `/rpc:host:/home/me/.cache/systemd-attach/id.log`.
+Missing logs are ignored; TRAMP or filesystem deletion errors are reported but
+metadata cleanup still proceeds.
 
 ## Dired
 
